@@ -2660,6 +2660,9 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
         return false;
     }
+    if (set_rows->src[3] != nullptr || set_rows->src[4] != nullptr) {
+        return false;
+    }
     // ne3 not tested
     if (rope->src[0]->ne[3] != 1) {
         return false;
@@ -5024,6 +5027,36 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                if (op->type == GGML_TYPE_F8_E4M3) {
+                    const int32_t head_dim = ggml_get_op_params_i32(op, 0);
+                    const int32_t block_size = ggml_get_op_params_i32(op, 1);
+                    const bool row_scaled = op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32;
+                    const bool block_scaled = op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_I8 && block_size == 32;
+                    return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_BLACKWELL &&
+                        op->src[0]->type == GGML_TYPE_F32 &&
+                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32) &&
+                        (row_scaled || block_scaled) &&
+                        (head_dim == 128 || head_dim == 256);
+                }
+                if (op->type == GGML_TYPE_F16 && op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F8_E4M3) {
+                    const int32_t head_dim  = ggml_get_op_params_i32(op, 0);
+                    const int32_t hot_size = ggml_get_op_params_i32(op, 1);
+                    const int32_t sink_size = ggml_get_op_params_i32(op, 2);
+                    const int32_t block_size = ggml_get_op_params_i32(op, 3);
+                    return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_BLACKWELL &&
+                        op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I64 &&
+                        op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_F16 &&
+                        op->src[4] != nullptr && op->src[4]->type == GGML_TYPE_I8 &&
+                        op->src[0]->ne[0] == op->src[2]->ne[0] && op->src[0]->ne[0] == op->src[3]->ne[0] &&
+                        op->src[2]->ne[1] == hot_size && op->src[4]->ne[0] == op->src[3]->ne[0] / 32 &&
+                        op->src[4]->ne[1] == op->src[3]->ne[1] &&
+                        (head_dim == 128 || head_dim == 256) && block_size == 32 && hot_size > sink_size && sink_size >= 0;
+                }
+#endif
+                if (op->src[3] != nullptr) {
+                    return false;
+                }
                 return (
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||

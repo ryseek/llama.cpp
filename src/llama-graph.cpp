@@ -2547,8 +2547,32 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * k_scale,
+         ggml_tensor * v_scale,
+         ggml_tensor * k_hot,
+         ggml_tensor * v_hot,
+         ggml_tensor * logical_idxs,
+             uint32_t   hot_size,
+             uint32_t   sink_size,
+             uint32_t   logical_n_kv) const {
+    const bool fp8_cache = k->type == GGML_TYPE_F8_E4M3 || v->type == GGML_TYPE_F8_E4M3;
+    const bool mxfp8 = fp8_cache && k_scale && k_scale->type == GGML_TYPE_I8;
+    const bool mxfp8_hybrid = k_hot || v_hot;
+    if (fp8_cache) {
+        GGML_ASSERT(k->type == GGML_TYPE_F8_E4M3 && v->type == GGML_TYPE_F8_E4M3);
+        GGML_ASSERT(k_scale && v_scale);
+        GGML_ASSERT(cparams.flash_attn && kq_b == nullptr);
+    }
+    if (mxfp8_hybrid) {
+        GGML_ASSERT(mxfp8 && k_hot && v_hot && logical_idxs);
+        GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
+        GGML_ASSERT(hot_size > sink_size);
+        GGML_ASSERT(logical_n_kv > 0);
+    }
+
     const bool v_trans = v->nb[1] > v->nb[2];
+    GGML_ASSERT(!fp8_cache || !v_trans);
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
@@ -2558,6 +2582,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (mxfp8_hybrid) {
+        k_hot = ggml_permute(ctx0, k_hot, 0, 2, 1, 3);
+        v_hot = ggml_permute(ctx0, v_hot, 0, 2, 1, 3);
+    }
 
     ggml_tensor * cur;
 
@@ -2584,6 +2612,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        if (mxfp8_hybrid) {
+            ggml_flash_attn_ext_add_mxfp8_hot(cur, k_scale, v_scale, k_hot, v_hot, logical_idxs,
+                    hot_size, sink_size, 32, logical_n_kv);
+        } else if (mxfp8) {
+            ggml_flash_attn_ext_add_kv_block_scales(cur, k_scale, v_scale, 32);
+        } else if (k_scale || v_scale) {
+            ggml_flash_attn_ext_add_kv_scales(cur, k_scale, v_scale);
+        }
 
         if (v_mla) {
 #if 0
@@ -2830,8 +2866,21 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k_scale = mctx_cur->get_k_scale(ctx0, il);
+    ggml_tensor * v_scale = mctx_cur->get_v_scale(ctx0, il);
+    ggml_tensor * k_hot = nullptr;
+    ggml_tensor * v_hot = nullptr;
+    ggml_tensor * logical_idxs = nullptr;
+    if (mctx_cur->get_mode() == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        k_hot = k;
+        v_hot = v;
+        k = mctx_cur->get_k_cold(ctx0, il);
+        v = mctx_cur->get_v_cold(ctx0, il);
+        logical_idxs = inp->get_k_idxs();
+    }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+            k_scale, v_scale, k_hot, v_hot, logical_idxs, mctx_cur->get_hot_size(), mctx_cur->get_sink_size(), mctx_cur->get_n_kv());
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3085,8 +3134,21 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k_scale = mctx_cur->get_k_scale(ctx0, il);
+    ggml_tensor * v_scale = mctx_cur->get_v_scale(ctx0, il);
+    ggml_tensor * k_hot = nullptr;
+    ggml_tensor * v_hot = nullptr;
+    ggml_tensor * logical_idxs = nullptr;
+    if (mctx_cur->get_mode() == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        k_hot = k;
+        v_hot = v;
+        k = mctx_cur->get_k_cold(ctx0, il);
+        v = mctx_cur->get_v_cold(ctx0, il);
+        logical_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+    }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+            k_scale, v_scale, k_hot, v_hot, logical_idxs, mctx_cur->get_hot_size(), mctx_cur->get_sink_size(), mctx_cur->get_n_kv());
     cb(cur, "kqv_out", il);
 
     if (v_rot) {

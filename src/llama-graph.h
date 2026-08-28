@@ -1172,7 +1172,15 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * k_scale = nullptr,
+            ggml_tensor * v_scale = nullptr,
+            ggml_tensor * k_hot = nullptr,
+            ggml_tensor * v_hot = nullptr,
+            ggml_tensor * logical_idxs = nullptr,
+                uint32_t   hot_size = 0,
+                uint32_t   sink_size = 0,
+                uint32_t   logical_n_kv = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

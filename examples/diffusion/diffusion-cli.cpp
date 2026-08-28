@@ -140,6 +140,7 @@ int main(int argc, char ** argv) {
     ctx_params.no_perf              = params.no_perf;
     ctx_params.type_k               = params.cache_type_k;
     ctx_params.type_v               = params.cache_type_v;
+    ctx_params.kv_cache_mode        = params.kv_cache_mode;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {

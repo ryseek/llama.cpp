@@ -381,6 +381,15 @@ extern "C" {
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+    // NVIDIA E4M3 finite-numbers format
+    typedef uint8_t ggml_fp8_e4m3_t;
+    GGML_API float            ggml_fp8_e4m3_to_fp32(ggml_fp8_e4m3_t);
+    GGML_API ggml_fp8_e4m3_t  ggml_fp32_to_fp8_e4m3(float);
+    GGML_API void             ggml_fp8_e4m3_to_fp32_row(const ggml_fp8_e4m3_t *, float *, int64_t);
+    GGML_API void             ggml_fp32_to_fp8_e4m3_row_ref(const float *, ggml_fp8_e4m3_t *, int64_t);
+    GGML_API float            ggml_ue8m0_to_fp32(uint8_t);
+    GGML_API uint8_t          ggml_mxfp8_e4m3_scale(float);
+
     struct ggml_object;
     struct ggml_context;
     struct ggml_cgraph;
@@ -430,7 +439,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_F8_E4M3 = 43,
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -1696,6 +1706,36 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // CUDA-only FP8 cache write. The scale destination is [n_head, ne1, ne2, ne3].
+    GGML_API struct ggml_tensor * ggml_set_rows_f8_scaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // FP8 destination
+            struct ggml_tensor  * s,  // F32 scale destination
+            struct ggml_tensor  * b,  // F32 source
+            struct ggml_tensor  * c,  // row indices
+            int32_t               head_dim);
+
+    // CUDA-only MXFP8 cache write. The UE8M0 scales are flattened as [block, head, row, stream].
+    GGML_API struct ggml_tensor * ggml_set_rows_f8_block_scaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // FP8 destination
+            struct ggml_tensor  * s,  // I8 UE8M0 scale destination
+            struct ggml_tensor  * b,  // F32 source
+            struct ggml_tensor  * c,  // row indices
+            int32_t               head_dim,
+            int32_t               block_size);
+
+    GGML_API struct ggml_tensor * ggml_set_rows_mxfp8_hot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hot,
+            struct ggml_tensor  * cold,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * logical,
+            int32_t               head_dim,
+            int32_t               hot_size,
+            int32_t               sink_size);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2449,6 +2489,30 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Scales are [n_head_kv, n_kv, ne3] and apply to the K/V cache tensors.
+    GGML_API void ggml_flash_attn_ext_add_kv_scales(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_scale,
+            struct ggml_tensor * v_scale);
+
+    GGML_API void ggml_flash_attn_ext_add_kv_block_scales(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_scale,
+            struct ggml_tensor * v_scale,
+            int32_t              block_size);
+
+    GGML_API void ggml_flash_attn_ext_add_mxfp8_hot(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_scale,
+            struct ggml_tensor * v_scale,
+            struct ggml_tensor * hot_k,
+            struct ggml_tensor * hot_v,
+            struct ggml_tensor * logical,
+            int32_t              hot_size,
+            int32_t              sink_size,
+            int32_t              block_size,
+            int32_t              n_kv);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

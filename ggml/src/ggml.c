@@ -507,6 +507,99 @@ void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
     }
 }
 
+float ggml_fp8_e4m3_to_fp32(ggml_fp8_e4m3_t x) {
+    const uint32_t sign = (uint32_t) (x & 0x80) << 24;
+    const uint32_t mag  = x & 0x7f;
+
+    if (mag == 0x7f) {
+        const union { uint32_t i; float f; } nan = { sign | 0x7fc00000 };
+        return nan.f;
+    }
+
+    const uint32_t exponent = mag >> 3;
+    const uint32_t mantissa = mag & 0x07;
+    const float value = exponent == 0 ? ldexpf((float) mantissa, -9) : ldexpf((float) (8 + mantissa), (int) exponent - 10);
+    return sign ? -value : value;
+}
+
+static uint8_t ggml_round_to_nearest_even_u8(float x) {
+    const float lower = floorf(x);
+    const float fraction = x - lower;
+    uint8_t result = (uint8_t) lower;
+
+    if (fraction > 0.5f || (fraction == 0.5f && (result & 1))) {
+        ++result;
+    }
+
+    return result;
+}
+
+ggml_fp8_e4m3_t ggml_fp32_to_fp8_e4m3(float x) {
+    const uint8_t sign = signbit(x) ? 0x80 : 0x00;
+    const float ax = fabsf(x);
+
+    if (isnan(x)) {
+        return sign | 0x7f;
+    }
+    if (!isfinite(x) || ax >= 448.0f) {
+        return sign | 0x7e;
+    }
+    if (ax < 0x1p-6f) {
+        return sign | ggml_round_to_nearest_even_u8(ldexpf(ax, 9));
+    }
+
+    int exponent;
+    frexpf(ax, &exponent);
+    exponent -= 1;
+
+    uint8_t significand = ggml_round_to_nearest_even_u8(ldexpf(ax, 3 - exponent));
+    if (significand == 16) {
+        significand = 8;
+        ++exponent;
+    }
+
+    uint8_t result = (uint8_t) (((exponent + 7) << 3) | (significand - 8));
+    if (result > 0x7e) {
+        result = 0x7e;
+    }
+    return sign | result;
+}
+
+void ggml_fp8_e4m3_to_fp32_row(const ggml_fp8_e4m3_t * x, float * y, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        y[i] = ggml_fp8_e4m3_to_fp32(x[i]);
+    }
+}
+
+void ggml_fp32_to_fp8_e4m3_row_ref(const float * x, ggml_fp8_e4m3_t * y, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        y[i] = ggml_fp32_to_fp8_e4m3(x[i]);
+    }
+}
+
+float ggml_ue8m0_to_fp32(uint8_t x) {
+    if (x == 0xff) {
+        return NAN;
+    }
+    return ldexpf(1.0f, (int) x - 127);
+}
+
+uint8_t ggml_mxfp8_e4m3_scale(float amax) {
+    if (!(amax > 0.0f)) {
+        return 0;
+    }
+    if (!isfinite(amax)) {
+        return 0xfe;
+    }
+
+    int exponent;
+    const float fraction = frexpf(amax, &exponent);
+    int scale_exponent = exponent - 9 + (fraction > 0.875f);
+    scale_exponent = scale_exponent < -127 ? -127 : scale_exponent;
+    scale_exponent = scale_exponent >  127 ?  127 : scale_exponent;
+    return (uint8_t) (scale_exponent + 127);
+}
+
 bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
     return memcmp(guid_a, guid_b, sizeof(ggml_guid)) == 0;
 }
@@ -923,6 +1016,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_tq2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq2_0_ref,
+    },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(ggml_fp8_e4m3_t),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) ggml_fp8_e4m3_to_fp32_row,
+        .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp8_e4m3_row_ref,
     },
     [36] = { // GGML_TYPE_IQ4_NL_4_4
         .type_name                = "TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking",
@@ -3962,6 +4063,141 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_set_rows_f8_scaled(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        int32_t               head_dim) {
+    GGML_ASSERT(a->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(s->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
+    GGML_ASSERT(head_dim > 0 && a->ne[0] % head_dim == 0);
+
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[2] == b->ne[2]);
+    GGML_ASSERT(a->ne[3] == b->ne[3]);
+    GGML_ASSERT(b->ne[1] == c->ne[0]);
+    GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
+    GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
+    GGML_ASSERT(c->ne[3] == 1);
+
+    GGML_ASSERT(s->ne[0] == a->ne[0] / head_dim);
+    GGML_ASSERT(s->ne[1] == a->ne[1]);
+    GGML_ASSERT(s->ne[2] == a->ne[2]);
+    GGML_ASSERT(s->ne[3] == a->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    GGML_ASSERT(ggml_is_contiguous_rows(s));
+    GGML_ASSERT(ggml_is_contiguous_rows(b));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+    ggml_set_op_params_i32(result, 0, head_dim);
+
+    result->op     = GGML_OP_SET_ROWS;
+    result->src[0] = b;
+    result->src[1] = c;
+    result->src[2] = a;
+    result->src[3] = s;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_set_rows_f8_block_scaled(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        int32_t               head_dim,
+        int32_t               block_size) {
+    GGML_ASSERT(a->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(s->type == GGML_TYPE_I8);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_size == 32);
+    GGML_ASSERT(head_dim > 0 && head_dim % block_size == 0 && a->ne[0] % head_dim == 0);
+
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[2] == b->ne[2]);
+    GGML_ASSERT(a->ne[3] == b->ne[3]);
+    GGML_ASSERT(b->ne[1] == c->ne[0]);
+    GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
+    GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
+    GGML_ASSERT(c->ne[3] == 1);
+
+    GGML_ASSERT(s->ne[0] == a->ne[0] / block_size);
+    GGML_ASSERT(s->ne[1] == a->ne[1]);
+    GGML_ASSERT(s->ne[2] == a->ne[2]);
+    GGML_ASSERT(s->ne[3] == a->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    GGML_ASSERT(ggml_is_contiguous_rows(s));
+    GGML_ASSERT(ggml_is_contiguous_rows(b));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+    ggml_set_op_params_i32(result, 0, head_dim);
+    ggml_set_op_params_i32(result, 1, block_size);
+
+    result->op     = GGML_OP_SET_ROWS;
+    result->src[0] = b;
+    result->src[1] = c;
+    result->src[2] = a;
+    result->src[3] = s;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_set_rows_mxfp8_hot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * hot,
+        struct ggml_tensor  * cold,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * logical,
+        int32_t               head_dim,
+        int32_t               hot_size,
+        int32_t               sink_size) {
+    GGML_ASSERT(hot->type == GGML_TYPE_F16);
+    GGML_ASSERT(cold->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(scale->type == GGML_TYPE_I8);
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(logical->type == GGML_TYPE_I64);
+    GGML_ASSERT(head_dim == 128 || head_dim == 256);
+    GGML_ASSERT(hot_size > sink_size && sink_size >= 0);
+    GGML_ASSERT(cold->ne[0] == src->ne[0] && hot->ne[0] == src->ne[0]);
+    GGML_ASSERT(cold->ne[0] % head_dim == 0);
+    GGML_ASSERT(hot->ne[1] == hot_size);
+    GGML_ASSERT(src->ne[1] == logical->ne[0]);
+    GGML_ASSERT(src->ne[2] == 1 && src->ne[3] == 1);
+    GGML_ASSERT(hot->ne[2] == 1 && hot->ne[3] == 1);
+    GGML_ASSERT(cold->ne[2] == 1 && cold->ne[3] == 1);
+    GGML_ASSERT(logical->ne[1] == 1 && logical->ne[2] == 1 && logical->ne[3] == 1);
+    GGML_ASSERT(scale->ne[0] == cold->ne[0] / 32);
+    GGML_ASSERT(scale->ne[1] == cold->ne[1]);
+    GGML_ASSERT(scale->ne[2] == cold->ne[2]);
+    GGML_ASSERT(scale->ne[3] == cold->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous_rows(hot));
+    GGML_ASSERT(ggml_is_contiguous_rows(cold));
+    GGML_ASSERT(ggml_is_contiguous_rows(scale));
+    GGML_ASSERT(ggml_is_contiguous_rows(src));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, hot);
+    ggml_set_op_params_i32(result, 0, head_dim);
+    ggml_set_op_params_i32(result, 1, hot_size);
+    ggml_set_op_params_i32(result, 2, sink_size);
+    ggml_set_op_params_i32(result, 3, 32);
+
+    result->op     = GGML_OP_SET_ROWS;
+    result->src[0] = src;
+    result->src[1] = logical;
+    result->src[2] = hot;
+    result->src[3] = cold;
+    result->src[4] = scale;
+
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
@@ -5509,6 +5745,93 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_add_kv_scales(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_scale,
+        struct ggml_tensor * v_scale) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL);
+    GGML_ASSERT(k_scale && v_scale);
+    GGML_ASSERT(k_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_scale->type == GGML_TYPE_F32);
+
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+    GGML_ASSERT(k_scale->ne[0] == k->ne[2]);
+    GGML_ASSERT(k_scale->ne[1] == k->ne[1]);
+    GGML_ASSERT(k_scale->ne[2] == k->ne[3]);
+    GGML_ASSERT(k_scale->ne[3] == 1);
+    GGML_ASSERT(v_scale->ne[0] == v->ne[2]);
+    GGML_ASSERT(v_scale->ne[1] == v->ne[1]);
+    GGML_ASSERT(v_scale->ne[2] == v->ne[3]);
+    GGML_ASSERT(v_scale->ne[3] == 1);
+
+    a->src[5] = k_scale;
+    a->src[6] = v_scale;
+}
+
+void ggml_flash_attn_ext_add_kv_block_scales(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_scale,
+        struct ggml_tensor * v_scale,
+        int32_t              block_size) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL);
+    GGML_ASSERT(k_scale && v_scale);
+    GGML_ASSERT(k_scale->type == GGML_TYPE_I8);
+    GGML_ASSERT(v_scale->type == GGML_TYPE_I8);
+    GGML_ASSERT(block_size == 32);
+
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+    GGML_ASSERT(k->ne[0] % block_size == 0 && v->ne[0] % block_size == 0);
+    GGML_ASSERT(k_scale->ne[0] == k->ne[0] / block_size * k->ne[2]);
+    GGML_ASSERT(k_scale->ne[1] == k->ne[1]);
+    GGML_ASSERT(k_scale->ne[2] == k->ne[3]);
+    GGML_ASSERT(k_scale->ne[3] == 1);
+    GGML_ASSERT(v_scale->ne[0] == v->ne[0] / block_size * v->ne[2]);
+    GGML_ASSERT(v_scale->ne[1] == v->ne[1]);
+    GGML_ASSERT(v_scale->ne[2] == v->ne[3]);
+    GGML_ASSERT(v_scale->ne[3] == 1);
+
+    ggml_set_op_params_i32(a, 4, block_size);
+    a->src[5] = k_scale;
+    a->src[6] = v_scale;
+}
+
+void ggml_flash_attn_ext_add_mxfp8_hot(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_scale,
+        struct ggml_tensor * v_scale,
+        struct ggml_tensor * hot_k,
+        struct ggml_tensor * hot_v,
+        struct ggml_tensor * logical,
+        int32_t              hot_size,
+        int32_t              sink_size,
+        int32_t              block_size,
+        int32_t              n_kv) {
+    ggml_flash_attn_ext_add_kv_block_scales(a, k_scale, v_scale, block_size);
+    GGML_ASSERT(a->src[7] == NULL && a->src[8] == NULL && a->src[9] == NULL);
+    GGML_ASSERT(hot_k && hot_v && logical);
+    GGML_ASSERT(hot_k->type == GGML_TYPE_F16 && hot_v->type == GGML_TYPE_F16);
+    GGML_ASSERT(logical->type == GGML_TYPE_I64);
+    GGML_ASSERT(hot_size > sink_size && sink_size >= 0);
+    GGML_ASSERT(n_kv > 0 && n_kv <= a->src[1]->ne[1] + hot_size);
+    GGML_ASSERT(hot_k->ne[0] == a->src[1]->ne[0] && hot_v->ne[0] == a->src[2]->ne[0]);
+    GGML_ASSERT(hot_k->ne[1] == hot_size && hot_v->ne[1] == hot_size);
+    GGML_ASSERT(hot_k->ne[2] == a->src[1]->ne[2] && hot_v->ne[2] == a->src[2]->ne[2]);
+    GGML_ASSERT(hot_k->ne[3] == a->src[1]->ne[3] && hot_v->ne[3] == a->src[2]->ne[3]);
+    GGML_ASSERT(logical->ne[0] > 0 && logical->ne[1] == 1 && logical->ne[2] == 1 && logical->ne[3] == 1);
+    GGML_ASSERT(a->src[3] && a->src[3]->ne[0] >= n_kv);
+
+    ggml_set_op_params_i32(a, 5, hot_size);
+    ggml_set_op_params_i32(a, 6, sink_size);
+    ggml_set_op_params_i32(a, 7, n_kv);
+    a->src[7] = hot_k;
+    a->src[8] = hot_v;
+    a->src[9] = logical;
 }
 
 // ggml_flash_attn_back

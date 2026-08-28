@@ -1153,6 +1153,24 @@ namespace ggml_cuda_mma {
 #endif // BLACKWELL_MMA_AVAILABLE
     }
 
+    static __device__ __forceinline__ void mma_f8_e4m3(
+            tile<16, 8, float> & D, const tile<16, 8, int> & A, const tile<8, 8, int> & B) {
+#ifdef BLACKWELL_MMA_AVAILABLE
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        float *     Dxf = (float *) D.x;
+
+        asm volatile(
+            "mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+f"(Dxf[0]), "+f"(Dxf[1]), "+f"(Dxf[2]), "+f"(Dxf[3])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // BLACKWELL_MMA_AVAILABLE
+    }
+
     static __device__ __forceinline__ void mma(
             tile<16, 8, float> & D, const tile<16, 8, half2> & A, const tile<8, 8, half2> & B) {
 #ifdef TURING_MMA_AVAILABLE

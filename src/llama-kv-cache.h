@@ -114,7 +114,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        llama_kv_cache_mode     mode = LLAMA_KV_CACHE_MODE_DEFAULT);
 
     ~llama_kv_cache() = default;
 
@@ -163,6 +164,13 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    llama_kv_cache_mode get_mode() const;
+    uint32_t get_hot_size() const;
+    uint32_t get_sink_size() const;
+    uint32_t get_recent_size() const;
+    uint32_t get_max_ubatch(uint32_t n_ubatch) const;
+    bool is_append_only_valid() const;
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
@@ -188,6 +196,10 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_scale(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_scale(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_cold(ggml_context * ctx, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * get_v_cold(ggml_context * ctx, int32_t il, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -254,12 +266,31 @@ private:
 
         ggml_tensor * k;
         ggml_tensor * v;
+        ggml_tensor * k_scale;
+        ggml_tensor * v_scale;
+        ggml_tensor * k_cold;
+        ggml_tensor * v_cold;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_scale_stream;
+        std::vector<ggml_tensor *> v_scale_stream;
+        std::vector<ggml_tensor *> k_cold_stream;
+        std::vector<ggml_tensor *> v_cold_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    const llama_kv_cache_mode mode;
+    const ggml_type cache_type_k;
+    const ggml_type cache_type_v;
+
+    const uint32_t hot_size;
+    const uint32_t sink_size;
+    const uint32_t recent_size;
+    const uint32_t cold_size;
+
+    bool append_only_valid = true;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -317,6 +348,8 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    bool validate_append_only(const llama_ubatch & ubatch, const slot_info * sinfo = nullptr) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -397,6 +430,14 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_scale(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_scale(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_cold(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_cold(ggml_context * ctx, int32_t il) const;
+
+    llama_kv_cache_mode get_mode() const;
+    uint32_t get_hot_size() const;
+    uint32_t get_sink_size() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

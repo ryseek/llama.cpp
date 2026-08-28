@@ -25,6 +25,8 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    llama_kv_cache_mode kv_mode = LLAMA_KV_CACHE_MODE_DEFAULT;
 };
 
 enum llama_memory_status {

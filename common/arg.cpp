@@ -305,6 +305,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F32,
     GGML_TYPE_F16,
     GGML_TYPE_BF16,
+    GGML_TYPE_F8_E4M3,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1,
@@ -328,6 +329,28 @@ static std::string get_all_kv_cache_types() {
         msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
     return msg.str();
+}
+
+static const char * kv_cache_mode_name(llama_kv_cache_mode mode) {
+    switch (mode) {
+        case LLAMA_KV_CACHE_MODE_DEFAULT:      return "default";
+        case LLAMA_KV_CACHE_MODE_MXFP8:        return "mxfp8";
+        case LLAMA_KV_CACHE_MODE_MXFP8_HYBRID: return "mxfp8-hybrid";
+    }
+    return "unknown";
+}
+
+static llama_kv_cache_mode kv_cache_mode_from_str(const std::string & value) {
+    if (value == "default") {
+        return LLAMA_KV_CACHE_MODE_DEFAULT;
+    }
+    if (value == "mxfp8") {
+        return LLAMA_KV_CACHE_MODE_MXFP8;
+    }
+    if (value == "mxfp8-hybrid") {
+        return LLAMA_KV_CACHE_MODE_MXFP8_HYBRID;
+    }
+    throw std::invalid_argument("unsupported KV cache mode: " + value);
 }
 
 static bool parse_bool_value(const std::string & value) {
@@ -887,6 +910,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+
+    if (params.kv_cache_mode != LLAMA_KV_CACHE_MODE_DEFAULT &&
+            (params.cache_type_k != GGML_TYPE_F8_E4M3 || params.cache_type_v != GGML_TYPE_F8_E4M3)) {
+        throw std::invalid_argument("error: MXFP8 cache modes require both cache types to be f8_e4m3\n");
+    }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -2456,6 +2484,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-cache-mode"}, "MODE",
+        string_format(
+            "KV cache storage mode\n"
+            "allowed values: default, mxfp8, mxfp8-hybrid\n"
+            "MXFP8 modes require -ctk f8_e4m3 and -ctv f8_e4m3\n"
+            "(default: %s)",
+            kv_cache_mode_name(params.kv_cache_mode)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.kv_cache_mode = kv_cache_mode_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_MODE"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

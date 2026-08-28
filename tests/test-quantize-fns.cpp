@@ -126,6 +126,35 @@ static int test_vec_dot_f32(bool verbose) {
     return num_failed;
 }
 
+static void test_fp8_e4m3(void) {
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
+    assert(std::string(ggml_type_name(GGML_TYPE_F8_E4M3)) == "f8_e4m3");
+    assert(traits->blck_size == 1);
+    assert(traits->type_size == 1);
+    assert(traits->is_quantized);
+
+    assert(ggml_fp32_to_fp8_e4m3(0.0f) == 0x00);
+    assert(ggml_fp32_to_fp8_e4m3(-0.0f) == 0x80);
+    assert(ggml_fp32_to_fp8_e4m3(0x1p-9f) == 0x01);
+    assert(ggml_fp32_to_fp8_e4m3(0x1p-6f) == 0x08);
+    assert(ggml_fp32_to_fp8_e4m3(1.0f) == 0x38);
+    assert(ggml_fp32_to_fp8_e4m3(-1.0f) == 0xb8);
+    assert(ggml_fp32_to_fp8_e4m3(448.0f) == 0x7e);
+    assert(ggml_fp32_to_fp8_e4m3(INFINITY) == 0x7e);
+    assert(ggml_fp32_to_fp8_e4m3(-INFINITY) == 0xfe);
+    assert((ggml_fp32_to_fp8_e4m3(NAN) & 0x7f) == 0x7f);
+
+    assert(ggml_fp32_to_fp8_e4m3(0x1p-10f) == 0x00);
+    assert(ggml_fp32_to_fp8_e4m3(3.0f * 0x1p-10f) == 0x02);
+    assert(ggml_fp32_to_fp8_e4m3(1.0625f) == 0x38);
+    assert(ggml_fp32_to_fp8_e4m3(1.1875f) == 0x3a);
+
+    for (int raw = 0; raw <= UINT8_MAX; ++raw) {
+        const ggml_fp8_e4m3_t encoded = (ggml_fp8_e4m3_t) raw;
+        assert(ggml_fp32_to_fp8_e4m3(ggml_fp8_e4m3_to_fp32(encoded)) == encoded);
+    }
+}
+
 static int test_vec_dot_q(bool verbose) {
     int num_failed = 0;
 
@@ -219,6 +248,7 @@ int main(int argc, char * argv[]) {
 
     int num_failed = 0;
 
+    test_fp8_e4m3();
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
 

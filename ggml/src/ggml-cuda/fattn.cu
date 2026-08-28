@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-f8.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -45,9 +46,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    const int64_t n_kv = KQV->src[7] ? ggml_get_op_params_i32(KQV, 7) : K->ne[1];
+
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -62,6 +65,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (K->type == GGML_TYPE_F8_E4M3 && use_gqa_opt) {
+        if (gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
@@ -330,10 +348,80 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
+    BEST_FATTN_KERNEL_F8_REF  =  50,
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
+
+static bool ggml_cuda_fattn_f8_supported(const int device, const ggml_tensor * dst) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const ggml_tensor * Q       = dst->src[0];
+    const ggml_tensor * K       = dst->src[1];
+    const ggml_tensor * V       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * k_scale = dst->src[5];
+    const ggml_tensor * v_scale = dst->src[6];
+    const ggml_tensor * hot_k   = dst->src[7];
+    const ggml_tensor * hot_v   = dst->src[8];
+    const ggml_tensor * logical = dst->src[9];
+    const bool V_is_K_view =
+        V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool block_scaled = k_scale && v_scale &&
+        k_scale->type == GGML_TYPE_I8 && v_scale->type == GGML_TYPE_I8;
+    const bool row_scaled = k_scale && v_scale &&
+        k_scale->type == GGML_TYPE_F32 && v_scale->type == GGML_TYPE_F32;
+    const bool hybrid = hot_k || hot_v || logical;
+
+    if (ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_BLACKWELL ||
+            Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F8_E4M3 || V->type != GGML_TYPE_F8_E4M3 ||
+            (Q->ne[0] != 128 && Q->ne[0] != 256) || K->ne[0] != Q->ne[0] || V->ne[0] != Q->ne[0] ||
+            K->ne[1] != V->ne[1] ||
+            K->ne[2] != V->ne[2] || K->ne[3] != V->ne[3] || Q->ne[2] % K->ne[2] != 0 ||
+            V_is_K_view || (!row_scaled && !block_scaled)) {
+        return false;
+    }
+    if (Q->nb[0] != sizeof(float) || K->nb[0] != 1 || V->nb[0] != 1) {
+        return false;
+    }
+
+    const int64_t scale_ne0 = row_scaled ? K->ne[2] : K->ne[0] / 32 * K->ne[2];
+    const size_t scale_type_size = row_scaled ? sizeof(float) : sizeof(int8_t);
+    if (k_scale->nb[0] != scale_type_size || v_scale->nb[0] != scale_type_size ||
+            k_scale->ne[0] != scale_ne0 || k_scale->ne[1] != K->ne[1] ||
+            k_scale->ne[2] != K->ne[3] || k_scale->ne[3] != 1 ||
+            v_scale->ne[0] != scale_ne0 || v_scale->ne[1] != V->ne[1] ||
+            v_scale->ne[2] != V->ne[3] || v_scale->ne[3] != 1) {
+        return false;
+    }
+
+    if (block_scaled && ggml_get_op_params_i32(dst, 4) != 32) {
+        return false;
+    }
+    if (hybrid) {
+        const int32_t hot_size  = ggml_get_op_params_i32(dst, 5);
+        const int32_t sink_size = ggml_get_op_params_i32(dst, 6);
+        const int32_t n_kv      = ggml_get_op_params_i32(dst, 7);
+        if (!block_scaled || !hot_k || !hot_v || !logical ||
+                hot_k->type != GGML_TYPE_F16 || hot_v->type != GGML_TYPE_F16 || logical->type != GGML_TYPE_I64 ||
+                hot_size <= sink_size || sink_size < 0 || n_kv <= 0 || n_kv > K->ne[1] + hot_size ||
+                hot_k->ne[0] != K->ne[0] || hot_v->ne[0] != V->ne[0] ||
+                hot_k->ne[1] != hot_size || hot_v->ne[1] != hot_size ||
+                hot_k->ne[2] != K->ne[2] || hot_v->ne[2] != V->ne[2] ||
+                hot_k->ne[3] != K->ne[3] || hot_v->ne[3] != V->ne[3] ||
+                hot_k->nb[0] != sizeof(half) || hot_v->nb[0] != sizeof(half) ||
+                logical->ne[0] <= 0 || logical->nb[0] != sizeof(int64_t) ||
+                K->ne[3] != 1 || !mask || mask->ne[0] < n_kv) {
+            return false;
+        }
+    }
+    return !mask || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {
@@ -366,6 +454,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    if (K->type == GGML_TYPE_F8_E4M3 || V->type == GGML_TYPE_F8_E4M3) {
+        if (!ggml_cuda_fattn_f8_supported(device, dst)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return dst->src[5]->type == GGML_TYPE_I8 || Q->ne[1] > 2 ?
+            BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_F8_REF;
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -548,6 +644,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_V = false;
 
     switch (kernel) {
+        case BEST_FATTN_KERNEL_F8_REF:
+            break;
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
@@ -572,6 +670,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
+        case BEST_FATTN_KERNEL_F8_REF:
+            ggml_cuda_flash_attn_ext_f8_ref(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;

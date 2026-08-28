@@ -193,6 +193,12 @@ extern "C" {
         LLAMA_FLASH_ATTN_TYPE_ENABLED  = 1,
     };
 
+    enum llama_kv_cache_mode {
+        LLAMA_KV_CACHE_MODE_DEFAULT      = 0,
+        LLAMA_KV_CACHE_MODE_MXFP8        = 1,
+        LLAMA_KV_CACHE_MODE_MXFP8_HYBRID = 2,
+    };
+
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
     enum llama_split_mode {
@@ -388,6 +394,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum llama_kv_cache_mode kv_cache_mode; // KV cache storage mode [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

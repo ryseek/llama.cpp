@@ -443,6 +443,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
+                (op->op != GGML_OP_SET_ROWS || op->src[3] == nullptr) &&
+                op->type != GGML_TYPE_F8_E4M3 &&
                 op->type != GGML_TYPE_IQ3_XXS &&
                 op->type != GGML_TYPE_IQ3_S   &&
                 op->type != GGML_TYPE_IQ2_XXS &&
@@ -450,6 +452,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ2_S   &&
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
+        case GGML_OP_FLASH_ATTN_EXT:
+            return
+                src0->type != GGML_TYPE_F8_E4M3 &&
+                src1->type != GGML_TYPE_F8_E4M3 &&
+                op->src[2]->type != GGML_TYPE_F8_E4M3 &&
+                op->src[5] == nullptr &&
+                op->src[6] == nullptr;
         case GGML_OP_MUL_MAT:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         case GGML_OP_SOFT_MAX_BACK: {

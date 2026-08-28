@@ -78,10 +78,14 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type   swa_type,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share,
-             const char *   name_tag) :
+        const  layer_reuse_cb & reuse,
+        const  layer_share_cb & share,
+                 const char *   name_tag,
+        llama_kv_cache_mode     mode) :
     model(model), hparams(hparams), v_trans(v_trans),
+    mode(mode), cache_type_k(type_k), cache_type_v(type_v),
+    hot_size(mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID ? kv_size/32 : 0),
+    sink_size(0), recent_size(hot_size - sink_size), cold_size(kv_size - hot_size),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -95,6 +99,22 @@ llama_kv_cache::llama_kv_cache(
         if (kv_size != size_other) {
             LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
             kv_size = size_other;
+        }
+    }
+
+    const bool mxfp8 = mode == LLAMA_KV_CACHE_MODE_MXFP8 || mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID;
+    if (mxfp8 && (type_k != GGML_TYPE_F8_E4M3 || type_v != GGML_TYPE_F8_E4M3)) {
+        throw std::runtime_error("MXFP8 cache mode requires F8_E4M3 K and V cache types");
+    }
+    if (mxfp8 && (v_trans || !offload || hparams.is_mla())) {
+        throw std::runtime_error("MXFP8 cache mode requires an offloaded non-MLA Flash Attention cache");
+    }
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        if (n_seq_max != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE || other || reuse || share) {
+            throw std::runtime_error("MXFP8 hybrid cache currently requires one sequence without SWA, sharing, or layer reuse");
+        }
+        if (hot_size == 0 || cold_size == 0 || recent_size == 0) {
+            throw std::runtime_error("MXFP8 hot cache requires at least 32 cache cells");
         }
     }
 
@@ -115,7 +135,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(6u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -231,23 +251,55 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        if (mxfp8 && (hparams.n_embd_head_k(il) % 32 != 0 || hparams.n_embd_head_v(il) % 32 != 0)) {
+            throw std::runtime_error(format("MXFP8 cache requires head dimensions divisible by 32 at layer %u", il));
+        }
+
+        const bool hot = mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID;
+        const uint32_t primary_size = hot ? hot_size : kv_size;
+        const ggml_type primary_type_k = hot ? GGML_TYPE_F16 : type_k;
+        const ggml_type primary_type_v = hot ? GGML_TYPE_F16 : type_v;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, primary_type_k, n_embd_k_gqa, primary_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, primary_type_v, n_embd_v_gqa, primary_size, n_stream) : nullptr;
+
+        const uint32_t scale_size = hot ? cold_size : kv_size;
+        const ggml_type scale_type = mxfp8 ? GGML_TYPE_I8 : GGML_TYPE_F32;
+        const uint32_t n_scale_k = mxfp8 ? n_embd_k_gqa/32 : hparams.n_head_kv(il);
+        const uint32_t n_scale_v = mxfp8 ? n_embd_v_gqa/32 : hparams.n_head_kv(il);
+
+        ggml_tensor * k_scale = has_k && type_k == GGML_TYPE_F8_E4M3 ? ggml_new_tensor_3d(ctx, scale_type, n_scale_k, scale_size, n_stream) : nullptr;
+        ggml_tensor * v_scale = has_v && type_v == GGML_TYPE_F8_E4M3 ? ggml_new_tensor_3d(ctx, scale_type, n_scale_v, scale_size, n_stream) : nullptr;
+        ggml_tensor * k_cold = hot && has_k ? ggml_new_tensor_3d(ctx, GGML_TYPE_F8_E4M3, n_embd_k_gqa, cold_size, n_stream) : nullptr;
+        ggml_tensor * v_cold = hot && has_v ? ggml_new_tensor_3d(ctx, GGML_TYPE_F8_E4M3, n_embd_v_gqa, cold_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+        k_scale && ggml_format_name(k_scale, "cache_%sk_scale_l%d", name_tag, il);
+        v_scale && ggml_format_name(v_scale, "cache_%sv_scale_l%d", name_tag, il);
+        k_cold && ggml_format_name(k_cold, "cache_%sk_cold_l%d", name_tag, il);
+        v_cold && ggml_format_name(v_cold, "cache_%sv_cold_l%d", name_tag, il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_scale_stream;
+        std::vector<ggml_tensor *> v_scale_stream;
+        std::vector<ggml_tensor *> k_cold_stream;
+        std::vector<ggml_tensor *> v_cold_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, primary_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, primary_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_scale_stream.push_back(k_scale ? ggml_view_2d(ctx, k_scale, n_scale_k, scale_size, k_scale->nb[1], s*k_scale->nb[2]) : nullptr);
+            v_scale_stream.push_back(v_scale ? ggml_view_2d(ctx, v_scale, n_scale_v, scale_size, v_scale->nb[1], s*v_scale->nb[2]) : nullptr);
+            k_cold_stream.push_back(k_cold ? ggml_view_2d(ctx, k_cold, n_embd_k_gqa, cold_size, k_cold->nb[1], s*k_cold->nb[2]) : nullptr);
+            v_cold_stream.push_back(v_cold ? ggml_view_2d(ctx, v_cold, n_embd_v_gqa, cold_size, v_cold->nb[1], s*v_cold->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_scale, v_scale, k_cold, v_cold,
+                k_stream, v_stream, k_scale_stream, v_scale_stream, k_cold_stream, v_cold_stream, });
     }
 
     if (reuse) {
@@ -303,6 +355,21 @@ llama_kv_cache::llama_kv_cache(
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+
+        size_t memory_size_k_scale = 0;
+        size_t memory_size_v_scale = 0;
+        for (const auto & layer : layers) {
+            memory_size_k_scale += layer.k_scale ? ggml_nbytes(layer.k_scale) : 0;
+            memory_size_v_scale += layer.v_scale ? ggml_nbytes(layer.v_scale) : 0;
+        }
+        if (memory_size_k_scale + memory_size_v_scale > 0) {
+            LLAMA_LOG_INFO("%s: scale storage: K = %.2f MiB, V = %.2f MiB\n", __func__,
+                    (float) memory_size_k_scale / (1024.0f * 1024.0f),
+                    (float) memory_size_v_scale / (1024.0f * 1024.0f));
+        }
+        if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+            LLAMA_LOG_INFO("%s: MXFP8 hybrid layout: cold = %u cells, F16 hot = %u cells\n", __func__, cold_size, hot_size);
+        }
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -378,9 +445,26 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    append_only_valid = true;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        const bool all_seqs = seq_id == -1 || seq_id == 0;
+        const bool all_pos  = p0 <= 0 && (p1 < 0 || p1 == std::numeric_limits<llama_pos>::max());
+        if (all_seqs && all_pos) {
+            clear(false);
+            return true;
+        }
+
+        if (append_only_valid) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache does not support partial sequence removal; clear the cache before reuse\n", __func__);
+        }
+        append_only_valid = false;
+        return false;
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -450,6 +534,17 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        if (seq_id_src == 0 && seq_id_dst == 0) {
+            return;
+        }
+        if (append_only_valid) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache does not support sequence copies\n", __func__);
+        }
+        append_only_valid = false;
+        return;
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -542,6 +637,17 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        if (seq_id == 0) {
+            return;
+        }
+        if (append_only_valid) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache supports only sequence 0\n", __func__);
+        }
+        append_only_valid = false;
+        return;
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -569,6 +675,17 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        if (seq_id == 0 && shift == 0) {
+            return;
+        }
+        if (append_only_valid) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache does not support position shifts\n", __func__);
+        }
+        append_only_valid = false;
+        return;
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -619,6 +736,17 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        if (seq_id == 0 && d == 1) {
+            return;
+        }
+        if (append_only_valid) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache does not support position division\n", __func__);
+        }
+        append_only_valid = false;
+        return;
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -706,6 +834,8 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             bool embd_all) {
     GGML_UNUSED(embd_all);
 
+    n_ubatch = get_max_ubatch(n_ubatch);
+
     do {
         balloc.split_reset();
 
@@ -752,6 +882,11 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID && !append_only_valid) {
+        LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache is invalid; clear it before reuse\n", __func__);
+        return {};
+    }
+
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
 
@@ -766,9 +901,19 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
+        if (!validate_append_only(ubatch)) {
+            success = false;
+            break;
+        }
+
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        const auto sinfo_new = find_slot(ubatch, mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID);
         if (sinfo_new.empty()) {
+            success = false;
+            break;
+        }
+
+        if (!validate_append_only(ubatch, &sinfo_new)) {
             success = false;
             break;
         }
@@ -815,6 +960,40 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
+bool llama_kv_cache::validate_append_only(const llama_ubatch & ubatch, const slot_info * sinfo) const {
+    if (mode != LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        return true;
+    }
+
+    const auto & cells = v_cells[0];
+    const uint32_t n_used = cells.get_used();
+    if (cells.used_max_p1() != n_used || ubatch.n_tokens == 0 || ubatch.n_tokens > recent_size || ubatch.n_seqs_unq != 1) {
+        LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache requires a contiguous single-sequence append of at most %u tokens\n", __func__, recent_size);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != (llama_pos) (n_used + i) || ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != 0) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache accepts only monotonically appended sequence-0 positions\n", __func__);
+            return false;
+        }
+    }
+
+    if (sinfo) {
+        if (sinfo->n_stream() != 1 || sinfo->strm[0] != 0 || sinfo->idxs[0].size() != ubatch.n_tokens) {
+            return false;
+        }
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (sinfo->idxs[0][i] != n_used + i) {
+                LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache slot allocation is not append-only\n", __func__);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -848,8 +1027,24 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
                 ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
 
+                if (layer.k_scale_stream[ssrc]) {
+                    ggml_backend_tensor_copy(layer.k_scale_stream[ssrc], layer.k_scale_stream[sdst]);
+                }
+
+                if (layer.k_cold_stream[ssrc]) {
+                    ggml_backend_tensor_copy(layer.k_cold_stream[ssrc], layer.k_cold_stream[sdst]);
+                }
+
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
+                }
+
+                if (layer.v_scale_stream[ssrc]) {
+                    ggml_backend_tensor_copy(layer.v_scale_stream[ssrc], layer.v_scale_stream[sdst]);
+                }
+
+                if (layer.v_cold_stream[ssrc]) {
+                    ggml_backend_tensor_copy(layer.v_cold_stream[ssrc], layer.v_cold_stream[sdst]);
                 }
             }
         }
@@ -1101,6 +1296,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         return;
     }
 
+    GGML_ASSERT(validate_append_only(ubatch, &sinfo));
+
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -1187,6 +1384,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (!layers.empty() && layers[0].k_scale) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1218,11 +1418,35 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
-    return layers[0].k->type;
+    return cache_type_k;
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v->type;
+    return cache_type_v;
+}
+
+llama_kv_cache_mode llama_kv_cache::get_mode() const {
+    return mode;
+}
+
+uint32_t llama_kv_cache::get_hot_size() const {
+    return hot_size;
+}
+
+uint32_t llama_kv_cache::get_sink_size() const {
+    return sink_size;
+}
+
+uint32_t llama_kv_cache::get_recent_size() const {
+    return recent_size;
+}
+
+uint32_t llama_kv_cache::get_max_ubatch(uint32_t n_ubatch) const {
+    return mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID ? std::min(n_ubatch, recent_size) : n_ubatch;
+}
+
+bool llama_kv_cache::is_append_only_valid() const {
+    return append_only_valid;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -1237,6 +1461,8 @@ std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
 }
 
 ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+    GGML_ASSERT(mode != LLAMA_KV_CACHE_MODE_MXFP8_HYBRID);
+
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
@@ -1276,6 +1502,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        return ggml_view_4d(ctx, k,
+                hparams.n_embd_head_k(il), hparams.n_head_kv(il), hot_size, ns,
+                ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+                ggml_row_size(k->type, n_embd_k_gqa),
+                ggml_row_size(k->type, n_embd_k_gqa*hot_size),
+                ggml_row_size(k->type, n_embd_k_gqa*hot_size)*sinfo.s0);
+    }
+
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
@@ -1297,6 +1532,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        return ggml_view_4d(ctx, v,
+                hparams.n_embd_head_v(il), hparams.n_head_kv(il), hot_size, ns,
+                ggml_row_size(v->type, hparams.n_embd_head_v(il)),
+                ggml_row_size(v->type, n_embd_v_gqa),
+                ggml_row_size(v->type, n_embd_v_gqa*hot_size),
+                ggml_row_size(v->type, n_embd_v_gqa*hot_size)*sinfo.s0);
+    }
+
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
@@ -1316,12 +1560,94 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
+ggml_tensor * llama_kv_cache::get_k_scale(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * scale = layers[ikv].k_scale;
+    if (!scale) {
+        return nullptr;
+    }
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8 || mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        const uint32_t n_group = hparams.n_embd_k_gqa(il)/32;
+        const uint32_t n_cell  = mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID ? cold_size : n_kv;
+
+        return ggml_view_3d(ctx, scale, n_group, n_cell, ns,
+                scale->nb[1], scale->nb[2], scale->nb[2]*sinfo.s0);
+    }
+
+    return ggml_view_3d(ctx, scale,
+            hparams.n_head_kv(il), n_kv, ns,
+            scale->nb[1], scale->nb[2], scale->nb[2]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_v_scale(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * scale = layers[ikv].v_scale;
+    if (!scale) {
+        return nullptr;
+    }
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8 || mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        const uint32_t n_group = hparams.n_embd_v_gqa(il)/32;
+        const uint32_t n_cell  = mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID ? cold_size : n_kv;
+
+        return ggml_view_3d(ctx, scale, n_group, n_cell, ns,
+                scale->nb[1], scale->nb[2], scale->nb[2]*sinfo.s0);
+    }
+
+    return ggml_view_3d(ctx, scale,
+            hparams.n_head_kv(il), n_kv, ns,
+            scale->nb[1], scale->nb[2], scale->nb[2]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_cold(ggml_context * ctx, int32_t il, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * k = layers[ikv].k_cold;
+    if (!k) {
+        return nullptr;
+    }
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint64_t n_embd = hparams.n_embd_k_gqa(il);
+    return ggml_view_4d(ctx, k,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), cold_size, ns,
+            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+            ggml_row_size(k->type, n_embd),
+            ggml_row_size(k->type, n_embd*cold_size),
+            ggml_row_size(k->type, n_embd*cold_size)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_v_cold(ggml_context * ctx, int32_t il, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * v = layers[ikv].v_cold;
+    if (!v) {
+        return nullptr;
+    }
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint64_t n_embd = hparams.n_embd_v_gqa(il);
+    return ggml_view_4d(ctx, v,
+            hparams.n_embd_head_v(il), hparams.n_head_kv(il), cold_size, ns,
+            ggml_row_size(v->type, hparams.n_embd_head_v(il)),
+            ggml_row_size(v->type, n_embd),
+            ggml_row_size(v->type, n_embd*cold_size),
+            ggml_row_size(v->type, n_embd*cold_size)*sinfo.s0);
+}
+
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
 
-    ggml_tensor * k = layers[ikv].k;
+    ggml_tensor * k       = layers[ikv].k;
+    ggml_tensor * k_scale = layers[ikv].k_scale;
+    ggml_tensor * k_cold  = layers[ikv].k_cold;
 
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
@@ -1345,6 +1671,23 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
         // merge the buffer across all streams because the idxs are global
         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        if (k_scale) {
+            k_scale = ggml_reshape_2d(ctx, k_scale, k_scale->ne[0], kv_size*n_stream);
+        }
+    }
+
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        GGML_ASSERT(k_cold && k_scale && n_stream == 1);
+        return ggml_set_rows_mxfp8_hot(ctx, k, k_cold, k_scale, k_cur, k_idxs,
+                n_embd_head, hot_size, sink_size);
+    }
+
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8) {
+        return ggml_set_rows_f8_block_scaled(ctx, k, k_scale, k_cur, k_idxs, n_embd_head, 32);
+    }
+
+    if (k_scale) {
+        return ggml_set_rows_f8_scaled(ctx, k, k_scale, k_cur, k_idxs, n_embd_head);
     }
 
     // store the current K values into the cache
@@ -1356,7 +1699,9 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    auto * v       = layers[ikv].v;
+    auto * v_scale = layers[ikv].v_scale;
+    auto * v_cold  = layers[ikv].v_cold;
 
     const int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
@@ -1381,10 +1726,29 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
             // merge the buffer across all streams because the idxs are global
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+            if (v_scale) {
+                v_scale = ggml_reshape_2d(ctx, v_scale, v_scale->ne[0], kv_size*n_stream);
+            }
+        }
+
+        if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+            GGML_ASSERT(v_cold && v_scale && n_stream == 1);
+            return ggml_set_rows_mxfp8_hot(ctx, v, v_cold, v_scale, v_cur, v_idxs,
+                    n_embd_head, hot_size, sink_size);
+        }
+
+        if (mode == LLAMA_KV_CACHE_MODE_MXFP8) {
+            return ggml_set_rows_f8_block_scaled(ctx, v, v_scale, v_cur, v_idxs, n_embd_head, 32);
+        }
+
+        if (v_scale) {
+            return ggml_set_rows_f8_scaled(ctx, v, v_scale, v_cur, v_idxs, n_embd_head);
         }
 
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
     }
+
+    GGML_ASSERT(v_scale == nullptr);
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
         // we can merge dims 0, 1 and 2
@@ -1945,6 +2309,8 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += layer.k_scale ? ggml_nbytes(layer.k_scale) : 0;
+        size_k_bytes += layer.k_cold ? ggml_nbytes(layer.k_cold) : 0;
     }
 
     return size_k_bytes;
@@ -1955,6 +2321,8 @@ size_t llama_kv_cache::size_v_bytes() const {
 
     for (const auto & layer : layers) {
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += layer.v_scale ? ggml_nbytes(layer.v_scale) : 0;
+        size_v_bytes += layer.v_cold ? ggml_nbytes(layer.v_cold) : 0;
     }
 
     return size_v_bytes;
@@ -2092,6 +2460,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        throw std::runtime_error("MXFP8 hybrid cache state serialization is not supported");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2171,6 +2543,11 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    if (mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        append_only_valid = false;
+        throw std::runtime_error("MXFP8 hybrid cache state restoration is not supported; clear the cache before reuse");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2283,6 +2660,23 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
 
+    const auto write_scale = [&](ggml_tensor * scale) {
+        if (!scale) {
+            return;
+        }
+
+        const int32_t scale_type_i = (int32_t) scale->type;
+        const uint64_t scale_size_row = ggml_row_size(scale->type, scale->ne[0]);
+
+        io.write(&scale_type_i, sizeof(scale_type_i));
+        io.write(&scale_size_row, sizeof(scale_size_row));
+
+        for (const auto & range : cr.data) {
+            const size_t range_size = range.second - range.first;
+            io.write_tensor(scale, range.first * scale_size_row, range_size * scale_size_row);
+        }
+    };
+
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
@@ -2306,6 +2700,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             const size_t buf_size = range_size * k_size_row;
             io.write_tensor(k, range.first * k_size_row, buf_size);
         }
+
+        write_scale(layer.k_scale_stream[cr.strm]);
     }
 
     if (!v_trans) {
@@ -2333,6 +2729,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 const size_t buf_size = range_size * v_size_row;
                 io.write_tensor(v, range.first * v_size_row, buf_size);
             }
+
+            write_scale(layer.v_scale_stream[cr.strm]);
         }
     } else {
         // When v is transposed, we also need the element size and get the element ranges from each row
@@ -2369,6 +2767,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                     io.write_tensor(v, src_offset, buf_size);
                 }
             }
+
+            write_scale(layer.v_scale_stream[cr.strm]);
         }
     }
 }
@@ -2554,6 +2954,40 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         return false;
     }
 
+    const auto read_scale = [&](ggml_tensor * scale, uint32_t il, const char * name) {
+        if (!scale) {
+            return true;
+        }
+
+        int32_t scale_type_i_ref;
+        io.read(&scale_type_i_ref, sizeof(scale_type_i_ref));
+        const int32_t scale_type_i = (int32_t) scale->type;
+        if (scale_type_i != scale_type_i_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched %s scale type (%d != %d, layer %d)\n", __func__, name, scale_type_i, scale_type_i_ref, il);
+            return false;
+        }
+
+        uint64_t scale_size_row_ref;
+        io.read(&scale_size_row_ref, sizeof(scale_size_row_ref));
+        const size_t scale_size_row = ggml_row_size(scale->type, scale->ne[0]);
+        if (scale_size_row != scale_size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched %s scale row size (%zu != %zu, layer %d)\n", __func__, name, scale_size_row, (size_t) scale_size_row_ref, il);
+            return false;
+        }
+
+        if (cell_count) {
+            if (sinfo.is_contiguous()) {
+                io.read_tensor(scale, sinfo.head() * scale_size_row, cell_count * scale_size_row);
+            } else {
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    io.read_tensor(scale, sinfo.idxs[0][i] * scale_size_row, scale_size_row);
+                }
+            }
+        }
+
+        return true;
+    };
+
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
@@ -2591,6 +3025,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     io.read_tensor(k, dst_offset, k_size_row);
                 }
             }
+        }
+
+        if (!read_scale(layer.k_scale_stream[strm], il, "key")) {
+            return false;
         }
     }
 
@@ -2634,6 +3072,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         io.read_tensor(v, dst_offset, v_size_row);
                     }
                 }
+            }
+
+            if (!read_scale(layer.v_scale_stream[strm], il, "value")) {
+                return false;
             }
         }
     } else {
@@ -2691,6 +3133,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         }
                     }
                 }
+            }
+
+            if (!read_scale(layer.v_scale_stream[strm], il, "value")) {
+                return false;
             }
         }
     }
@@ -2793,6 +3239,34 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_scale(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_scale(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_scale(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_scale(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_cold(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_cold(ctx, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_cold(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_cold(ctx, il, sinfos[i_cur]);
+}
+
+llama_kv_cache_mode llama_kv_cache_context::get_mode() const {
+    return kv->get_mode();
+}
+
+uint32_t llama_kv_cache_context::get_hot_size() const {
+    return kv->get_hot_size();
+}
+
+uint32_t llama_kv_cache_context::get_sink_size() const {
+    return kv->get_sink_size();
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

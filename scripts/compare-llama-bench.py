@@ -26,21 +26,21 @@ logger = logging.getLogger("compare-llama-bench")
 LLAMA_BENCH_DB_FIELDS = [
     "build_commit", "build_number", "cpu_info",       "gpu_info",   "backends",     "model_filename",
     "model_type",   "model_size",   "model_n_params", "n_batch",    "n_ubatch",     "n_threads",
-    "cpu_mask",     "cpu_strict",   "poll",           "type_k",     "type_v",       "n_gpu_layers",
-    "split_mode",   "main_gpu",     "no_kv_offload",  "flash_attn", "tensor_split", "tensor_buft_overrides",
-    "load_mode",    "embeddings",   "no_op_offload",  "n_prompt",   "n_gen",        "n_depth",
-    "test_time",    "avg_ns",       "stddev_ns",      "avg_ts",     "stddev_ts",    "n_cpu_moe",
-    "fit_target",   "fit_min_ctx"
+    "cpu_mask",     "cpu_strict",   "poll",           "type_k",     "type_v",       "kv_cache_mode",
+    "n_gpu_layers", "split_mode",   "main_gpu",       "no_kv_offload", "flash_attn", "tensor_split",
+    "tensor_buft_overrides",         "load_mode",      "embeddings", "no_op_offload", "n_prompt", "n_gen",
+    "n_depth",      "test_time",    "avg_ns",         "stddev_ns",  "avg_ts",        "stddev_ts",
+    "n_cpu_moe",    "fit_target",   "fit_min_ctx"
 ]
 
 LLAMA_BENCH_DB_TYPES = [
     "TEXT",    "INTEGER", "TEXT",    "TEXT",    "TEXT",    "TEXT",
     "TEXT",    "INTEGER", "INTEGER", "INTEGER", "INTEGER", "INTEGER",
-    "TEXT",    "INTEGER", "INTEGER", "TEXT",    "TEXT",    "INTEGER",
-    "TEXT",    "INTEGER", "INTEGER", "INTEGER", "TEXT",    "TEXT",
-    "TEXT", "INTEGER", "INTEGER", "INTEGER", "INTEGER", "INTEGER",
-    "TEXT",    "INTEGER", "INTEGER", "REAL",    "REAL",    "INTEGER",
-    "INTEGER", "INTEGER"
+    "TEXT",    "INTEGER", "INTEGER", "TEXT",    "TEXT",    "TEXT",
+    "INTEGER", "TEXT",    "INTEGER", "INTEGER", "INTEGER", "TEXT",
+    "TEXT",    "TEXT",    "INTEGER", "INTEGER", "INTEGER", "INTEGER",
+    "INTEGER", "TEXT",    "INTEGER", "INTEGER", "REAL",    "REAL",
+    "INTEGER", "INTEGER", "INTEGER"
 ]
 
 # All test-backend-ops SQL fields
@@ -62,7 +62,7 @@ assert len(TEST_BACKEND_OPS_DB_FIELDS) == len(TEST_BACKEND_OPS_DB_TYPES)
 # Properties by which to differentiate results per commit for llama-bench:
 LLAMA_BENCH_KEY_PROPERTIES = [
     "cpu_info", "gpu_info", "backends", "n_gpu_layers", "n_cpu_moe", "tensor_buft_overrides", "model_filename", "model_type",
-    "n_batch", "n_ubatch", "embeddings", "cpu_mask", "cpu_strict", "poll", "n_threads", "type_k", "type_v",
+    "n_batch", "n_ubatch", "embeddings", "cpu_mask", "cpu_strict", "poll", "n_threads", "type_k", "type_v", "kv_cache_mode",
     "load_mode", "no_kv_offload", "split_mode", "main_gpu", "tensor_split", "flash_attn", "n_prompt", "n_gen", "n_depth",
     "fit_target", "fit_min_ctx"
 ]
@@ -82,6 +82,7 @@ LLAMA_BENCH_PRETTY_NAMES = {
     "tensor_buft_overrides": "Tensor overrides", "model_filename": "File", "model_type": "Model", "model_size": "Model size [GiB]",
     "model_n_params": "Num. of par.", "n_batch": "Batch size", "n_ubatch": "Microbatch size", "embeddings": "Embeddings",
     "cpu_mask": "CPU mask", "cpu_strict": "CPU strict", "poll": "Poll", "n_threads": "Threads", "type_k": "K type", "type_v": "V type",
+    "kv_cache_mode": "KV cache mode",
     "load_mode": "Load mode", "no_kv_offload": "NKVO", "split_mode": "Split mode", "main_gpu": "Main GPU", "tensor_split": "Tensor split",
     "flash_attn": "FlashAttention",
 }
@@ -243,6 +244,10 @@ class LlamaBenchData:
         if not keys >= self.check_keys:
             return self.check_keys - keys
         return None
+
+    def _add_legacy_defaults(self, entry: dict) -> None:
+        if self.tool == "llama-bench" and not entry.get("kv_cache_mode"):
+            entry["kv_cache_mode"] = "default"
 
     def find_parent_in_data(self, commit: git.Commit) -> Optional[str]:
         """Helper method to find the most recent parent measured in number of commits for which there is data."""
@@ -436,6 +441,19 @@ class LlamaBenchDataSQLite3File(LlamaBenchDataSQLite3):
             raise RuntimeError(f"Unknown tool: {tool}")
 
         super().__init__(tool)
+        if self.tool == "llama-bench":
+            columns = [row[1] for row in self.cursor.execute(f"PRAGMA table_info({self.table_name});")]
+            if "kv_cache_mode" not in columns:
+                self.cursor.execute(f"CREATE TEMP VIEW llama_bench_compat AS SELECT *, 'default' AS kv_cache_mode FROM {self.table_name};")
+            else:
+                select_columns = []
+                for column in columns:
+                    if column == "kv_cache_mode":
+                        select_columns.append("COALESCE(NULLIF(kv_cache_mode, ''), 'default') AS kv_cache_mode")
+                    else:
+                        select_columns.append(f'"{column}"')
+                self.cursor.execute(f"CREATE TEMP VIEW llama_bench_compat AS SELECT {', '.join(select_columns)} FROM {self.table_name};")
+            self.table_name = "llama_bench_compat"
         self._builds_init()
 
     @staticmethod
@@ -464,6 +482,7 @@ class LlamaBenchDataJSONL(LlamaBenchDataSQLite3):
         with open(data_file, "r", encoding="utf-8") as fp:
             for i, line in enumerate(fp):
                 parsed = json.loads(line)
+                self._add_legacy_defaults(parsed)
 
                 for k in parsed.keys() - set(db_fields):
                     del parsed[k]
@@ -501,6 +520,7 @@ class LlamaBenchDataJSON(LlamaBenchDataSQLite3):
                 parsed = json.load(fp)
 
                 for i, entry in enumerate(parsed):
+                    self._add_legacy_defaults(entry)
                     for k in entry.keys() - set(db_fields):
                         del entry[k]
 
@@ -537,6 +557,7 @@ class LlamaBenchDataCSV(LlamaBenchDataSQLite3):
         for data_file in data_files:
             with open(data_file, "r", encoding="utf-8") as fp:
                 for i, parsed in enumerate(csv.DictReader(fp)):
+                    self._add_legacy_defaults(parsed)
                     keys = set(parsed.keys())
 
                     for k in keys - set(db_fields):

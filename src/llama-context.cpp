@@ -390,6 +390,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.kv_mode   =*/ params.kv_cache_mode,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3617,6 +3618,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kv_cache_mode               =*/ LLAMA_KV_CACHE_MODE_DEFAULT,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -3680,6 +3682,81 @@ llama_context * llama_init_from_model(
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
             LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
             return nullptr;
+        }
+    }
+
+    const bool fp8_cache_k = params.type_k == GGML_TYPE_F8_E4M3;
+    const bool fp8_cache_v = params.type_v == GGML_TYPE_F8_E4M3;
+
+    const bool mxfp8_cache = params.kv_cache_mode == LLAMA_KV_CACHE_MODE_MXFP8 ||
+                             params.kv_cache_mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID;
+    if (params.kv_cache_mode != LLAMA_KV_CACHE_MODE_DEFAULT && !mxfp8_cache) {
+        LLAMA_LOG_ERROR("%s: unknown KV cache mode %d\n", __func__, (int) params.kv_cache_mode);
+        return nullptr;
+    }
+    if (mxfp8_cache && (!fp8_cache_k || !fp8_cache_v)) {
+        LLAMA_LOG_ERROR("%s: MXFP8 cache modes require both K and V to use F8_E4M3\n", __func__);
+        return nullptr;
+    }
+    if (params.kv_cache_mode == LLAMA_KV_CACHE_MODE_MXFP8_HYBRID) {
+        if (params.n_seq_max > 1) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache currently supports one sequence\n", __func__);
+            return nullptr;
+        }
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.n_rs_seq != 0 || params.ctx_other != nullptr) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache does not support MTP, recurrent rollback, or shared cache contexts\n", __func__);
+            return nullptr;
+        }
+        if (model->hparams.is_swa_any()) {
+            LLAMA_LOG_ERROR("%s: MXFP8 hybrid cache does not support sliding-window attention\n", __func__);
+            return nullptr;
+        }
+    }
+
+    if (fp8_cache_k || fp8_cache_v) {
+        if (!fp8_cache_k || !fp8_cache_v) {
+            LLAMA_LOG_ERROR("%s: F8_E4M3 cache requires both K and V to use F8_E4M3\n", __func__);
+            return nullptr;
+        }
+        if (!params.offload_kqv) {
+            LLAMA_LOG_ERROR("%s: F8_E4M3 cache requires KV offload\n", __func__);
+            return nullptr;
+        }
+        if (model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 ||
+                (model->arch == LLM_ARCH_DFLASH && model->hparams.dsv4_hc_mult > 0)) {
+            LLAMA_LOG_ERROR("%s: F8_E4M3 cache does not support MLA or DSV4 cache layouts\n", __func__);
+            return nullptr;
+        }
+        if (model->arch == LLM_ARCH_QWEN4EXP || model->arch == LLM_ARCH_MINIMAX_M3) {
+            LLAMA_LOG_ERROR("%s: F8_E4M3 cache does not support custom sparse-attention cache layouts\n", __func__);
+            return nullptr;
+        }
+        if (model->arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            LLAMA_LOG_ERROR("%s: F8_E4M3 cache does not support shared assistant cache layouts\n", __func__);
+            return nullptr;
+        }
+        if (model->n_devices() != 1) {
+            LLAMA_LOG_ERROR("%s: F8_E4M3 cache currently requires one CUDA device\n", __func__);
+            return nullptr;
+        }
+        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+            if (!model->hparams.has_kv(il)) {
+                continue;
+            }
+            const uint32_t head_k = model->hparams.n_embd_head_k(il);
+            const uint32_t head_v = model->hparams.n_embd_head_v(il);
+            if (head_k != head_v || (head_k != 128 && head_k != 256)) {
+                LLAMA_LOG_ERROR("%s: F8_E4M3 cache requires matching 128- or 256-wide K/V heads (layer %u has K=%u, V=%u)\n",
+                        __func__, il, head_k, head_v);
+                return nullptr;
+            }
+            ggml_backend_dev_t dev = model->dev_layer(il);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (!reg || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+                LLAMA_LOG_ERROR("%s: F8_E4M3 cache requires every attention layer on CUDA (layer %u is on %s)\n", __func__, il,
+                        dev ? ggml_backend_dev_name(dev) : "no device");
+                return nullptr;
+            }
         }
     }
 

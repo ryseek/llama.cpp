@@ -299,6 +299,30 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    add_executable(test-fp8-kv test-fp8-kv.cpp)
+    target_link_libraries(test-fp8-kv PRIVATE ggml)
+    llama_test(test-fp8-kv LABEL "cuda")
+
+    if (GGML_CUDA)
+        find_package(CUDAToolkit 12.8 QUIET)
+        if (CUDAToolkit_FOUND)
+            enable_language(CUDA)
+            add_executable(test-fp8-mma-sm120 test-fp8-mma-sm120.cu)
+            target_include_directories(test-fp8-mma-sm120 PRIVATE
+                ${PROJECT_SOURCE_DIR}/ggml/include
+                ${PROJECT_SOURCE_DIR}/ggml/src
+                ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+            target_link_libraries(test-fp8-mma-sm120 PRIVATE ggml-base ggml-cuda CUDA::cublas CUDA::cuda_driver)
+            set_target_properties(test-fp8-mma-sm120 PROPERTIES
+                CUDA_ARCHITECTURES "120a-real"
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES)
+            llama_test(test-fp8-mma-sm120 LABEL "cuda")
+        endif()
+    endif()
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

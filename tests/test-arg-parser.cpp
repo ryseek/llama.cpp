@@ -249,6 +249,53 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    {
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "f8_e4m3", "-ctv", "f8_e4m3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(cache_params.cache_type_k == GGML_TYPE_F8_E4M3);
+        assert(cache_params.cache_type_v == GGML_TYPE_F8_E4M3);
+        assert(cache_params.kv_cache_mode == LLAMA_KV_CACHE_MODE_DEFAULT);
+    }
+
+    {
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-cache-mode", "default"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(cache_params.cache_type_k == GGML_TYPE_F16);
+        assert(cache_params.cache_type_v == GGML_TYPE_F16);
+        assert(cache_params.kv_cache_mode == LLAMA_KV_CACHE_MODE_DEFAULT);
+    }
+
+    for (const auto & mode : { std::string("mxfp8"), std::string("mxfp8-hybrid") }) {
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "f8_e4m3", "-ctv", "f8_e4m3", "--kv-cache-mode", mode};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(cache_params.cache_type_k == GGML_TYPE_F8_E4M3);
+        assert(cache_params.cache_type_v == GGML_TYPE_F8_E4M3);
+        const auto expected = mode == "mxfp8" ? LLAMA_KV_CACHE_MODE_MXFP8 : LLAMA_KV_CACHE_MODE_MXFP8_HYBRID;
+        assert(cache_params.kv_cache_mode == expected);
+        assert(common_context_params_to_llama(cache_params).kv_cache_mode == expected);
+    }
+
+    {
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-cache-mode", "mxfp8"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "f8_e4m3", "-ctv", "f16", "--kv-cache-mode", "mxfp8-hybrid"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "-ctk", "f8_e4m3", "-ctv", "f8_e4m3", "--kv-cache-mode", "unknown"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+    }
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
